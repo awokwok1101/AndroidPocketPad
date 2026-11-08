@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Display
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -28,6 +29,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -39,6 +41,7 @@ import com.dathaze.pocketpad.hid.HidGamepadManager
 import com.dathaze.pocketpad.ui.BackgroundImage
 import com.dathaze.pocketpad.ui.ControllerView
 import com.dathaze.pocketpad.ui.Haptics
+import com.dathaze.pocketpad.ui.StickResponse
 import com.dathaze.pocketpad.update.UpdateFlow
 import com.dathaze.pocketpad.usb.Ds3UsbDriver
 import kotlin.math.roundToInt
@@ -52,6 +55,7 @@ class MainActivity : AppCompatActivity(),
 
     private lateinit var controllerView: ControllerView
     private lateinit var statusView: TextView
+    private lateinit var refreshView: TextView
     private lateinit var editBar: android.widget.LinearLayout
     private lateinit var hidManager: HidGamepadManager
     private lateinit var ds3Driver: Ds3UsbDriver
@@ -70,6 +74,13 @@ class MainActivity : AppCompatActivity(),
     private var tvNavigation = false
 
     /**
+     * Stick deadzone and curve as they were when layout-edit mode opened, so
+     * CANCEL can put them back the way it puts the positions back.
+     */
+    private var editDeadzone = StickResponse.DEADZONE_DEFAULT
+    private var editCurve = StickResponse.CURVE_DEFAULT
+
+    /**
      * Physical controller input, kept per device so one disconnecting drops
      * only its own contribution.
      */
@@ -85,6 +96,7 @@ class MainActivity : AppCompatActivity(),
 
         controllerView = findViewById(R.id.controller)
         statusView = findViewById(R.id.status)
+        refreshView = findViewById(R.id.refreshRate)
         editBar = findViewById(R.id.editBar)
         controllerView.listener = this
 
@@ -93,6 +105,7 @@ class MainActivity : AppCompatActivity(),
                 saveBackgroundPan()
             } else {
                 controllerView.saveEditedLayout()
+                saveStickResponse()
                 finishLayoutEdit()
                 Toast.makeText(this, R.string.edit_saved, Toast.LENGTH_SHORT).show()
             }
@@ -102,6 +115,10 @@ class MainActivity : AppCompatActivity(),
                 controllerView.centerBackground()
             } else {
                 controllerView.resetLayoutToDefault()
+                // "Defaults" has to mean the sticks too, or the button restores
+                // half of what it claims.
+                controllerView.stickDeadzone = StickResponse.DEADZONE_DEFAULT
+                controllerView.stickCurve = StickResponse.CURVE_DEFAULT
                 Toast.makeText(this, R.string.edit_defaults_restored, Toast.LENGTH_SHORT).show()
             }
         }
@@ -115,12 +132,14 @@ class MainActivity : AppCompatActivity(),
                 controllerView.finishBackgroundPan()
             } else {
                 controllerView.cancelLayoutEdit()
+                restoreStickResponse()
             }
             finishLayoutEdit()
         }
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enterImmersiveMode()
+        requestFastestRefreshRate()
 
         // Build the Bluetooth manager before restoring preferences: applying a
         // saved skin fires onTouchStateChanged, which sends through hidManager.
@@ -150,6 +169,10 @@ class MainActivity : AppCompatActivity(),
 
     override fun onResume() {
         super.onResume()
+        // The panel's rate can change while the app is in the background (battery saver, an
+        // adaptive mode), so the readout is refreshed rather than trusted from launch.
+        mainHandler.removeCallbacks(refreshTicker)
+        mainHandler.post(refreshTicker)
         // If Bluetooth was off at launch, retry once the user comes back.
         if (::hidManager.isInitialized && hasBluetoothPermissions()) hidManager.start()
         // A controller may have been unplugged while we were away.
@@ -158,6 +181,13 @@ class MainActivity : AppCompatActivity(),
         // waiting on that permission back in front of the user. Null unless they opened the
         // updater, so this costs nothing for everyone else.
         updateFlow?.onActivityResumed()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Nothing to show while the pad is not on screen; stop waking the UI thread every
+        // second for a number nobody can see.
+        mainHandler.removeCallbacks(refreshTicker)
     }
 
     /**
@@ -200,6 +230,7 @@ class MainActivity : AppCompatActivity(),
             ?.unregisterInputDeviceListener(inputDeviceListener)
         if (::ds3Driver.isInitialized) ds3Driver.release()
         if (::hidManager.isInitialized) hidManager.stop()
+        mainHandler.removeCallbacks(refreshTicker)
         // Guarded for the same reason as the two above: setContentView or findViewById failing
         // would leave this unset, and an unguarded read here would throw on the way out and
         // bury the exception that actually caused the problem.
@@ -208,19 +239,95 @@ class MainActivity : AppCompatActivity(),
 
     private fun enterImmersiveMode() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Draw into the camera cutout. Without this the window is laid out clear of the notch
+        // and leaves an empty strip along the edge — the pad looks a few pixels short of the
+        // screen even though the system bars are hidden. The theme sets this for the first
+        // frame; doing it again here covers the case where something reset the attributes.
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         WindowInsetsControllerCompat(window, controllerView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
-        // Keep the status pill clear of the camera cutout.
-        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(statusView) { view, insets ->
-            val top = insets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
-            ).top
-            view.translationY = top.toFloat()
-            insets
+        // Hiding the bars changes the insets, and the pad lays itself out from them.
+        controllerView.requestApplyInsets()
+        keepPillsBelowCutout()
+    }
+
+    /**
+     * Keep the two top pills clear of the camera cutout.
+     *
+     * Only the words move: the controller keeps drawing to the edges of the screen, which is
+     * the whole point of immersive mode.
+     */
+    private fun keepPillsBelowCutout() {
+        for (view in listOf(statusView, refreshView)) {
+            ViewCompat.setOnApplyWindowInsetsListener(view) { v, insets ->
+                val top = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+                ).top
+                v.translationY = top.toFloat()
+                insets
+            }
         }
+    }
+
+    /** The display whose rate the pad runs at; `defaultDisplay` before API 30. */
+    @Suppress("DEPRECATION")
+    private fun currentDisplay(): Display? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
+
+    /**
+     * The rate the screen is running at, in the corner.
+     *
+     * It is the honest number for "how fast is the pad": touch events are handed to the app
+     * once per frame, so the panel's rate is the ceiling on how quickly any press can leave
+     * the phone, and it is what [requestFastestRefreshRate] asks for. Read every second rather
+     * than once, because panels change mode on their own — battery saver will happily drop a
+     * 120 Hz screen to 60 Hz while the readout is on screen.
+     */
+    private fun showRefreshRate() {
+        val display = currentDisplay() ?: return
+        val hz = display.mode?.refreshRate ?: return
+        refreshView.text = getString(R.string.refresh_rate, hz.roundToInt())
+    }
+
+    /** Repeats every second while the pad is on screen. */
+    private val refreshTicker = object : Runnable {
+        override fun run() {
+            showRefreshRate()
+            mainHandler.postDelayed(this, REFRESH_POLL_MS)
+        }
+    }
+
+    /**
+     * Ask the window to run on the fastest mode the panel offers.
+     *
+     * Touch events reach the app once per frame, so on a 60 Hz panel a press can
+     * wait up to ~16 ms simply to be handed over; at 120 Hz that halves. It is the
+     * last stretch of the path where the app's own side still costs time — once
+     * the event arrives, the report leaves straight away without waiting for a
+     * frame.
+     *
+     * A request only: a 60 Hz panel has nothing faster to pick, battery saver
+     * ignores it, and panels that vary their own rate may still slow down while
+     * the pad sits untouched. Only a mode with the same resolution as the one in
+     * use is chosen, so asking for the faster rate cannot relayout the pad.
+     */
+    private fun requestFastestRefreshRate() {
+        val display = currentDisplay()
+        val current = display?.mode ?: return
+        val fastest = display.supportedModes
+            .filter {
+                it.physicalWidth == current.physicalWidth &&
+                    it.physicalHeight == current.physicalHeight
+            }
+            .maxByOrNull { it.refreshRate } ?: return
+        if (fastest.refreshRate <= current.refreshRate) return
+        window.attributes = window.attributes.apply { preferredDisplayModeId = fastest.modeId }
     }
 
     // ------------------------------------------------------------ permissions
@@ -307,6 +414,8 @@ class MainActivity : AppCompatActivity(),
             else -> Haptics.Level.STRONG
         }
         tvNavigation = prefs.getBoolean(PREF_TV_NAV, false)
+        controllerView.stickDeadzone = prefs.getFloat(PREF_STICK_DEADZONE, StickResponse.DEADZONE_DEFAULT)
+        controllerView.stickCurve = prefs.getFloat(PREF_STICK_CURVE, StickResponse.CURVE_DEFAULT)
     }
 
     @SuppressLint("MissingPermission")
@@ -361,15 +470,18 @@ class MainActivity : AppCompatActivity(),
     }
 
     private fun startLayoutEdit() {
+        rememberStickResponse()
         controllerView.enterLayoutEditMode()
         editBar.visibility = android.view.View.VISIBLE
         statusView.visibility = android.view.View.GONE
+        refreshView.visibility = android.view.View.GONE
         Toast.makeText(this, R.string.edit_hint, Toast.LENGTH_LONG).show()
     }
 
     private fun finishLayoutEdit() {
         editBar.visibility = android.view.View.GONE
         statusView.visibility = android.view.View.VISIBLE
+        refreshView.visibility = android.view.View.VISIBLE
     }
 
     // ---------------------------------------------------- background picture
@@ -477,6 +589,7 @@ class MainActivity : AppCompatActivity(),
         controllerView.enterBackgroundPanMode()
         editBar.visibility = android.view.View.VISIBLE
         statusView.visibility = android.view.View.GONE
+        refreshView.visibility = android.view.View.GONE
         Toast.makeText(this, R.string.bg_hint, Toast.LENGTH_LONG).show()
     }
 
@@ -594,6 +707,36 @@ class MainActivity : AppCompatActivity(),
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    /**
+     * Deadzone and response curve for both sticks.
+     *
+     * Both apply live while the dialog is open, and are put back on cancel, so
+     * the pad never keeps a value the user has just rejected. Only OK persists.
+     */
+    // ------------------------------------------- stick deadzone and curve
+
+    // Both are edited on the stick's own panel in layout-edit mode (see
+    // ControllerView.drawResizeMenu) rather than in a dialog: they are the only
+    // settings a stick has that a button does not, so they belong next to its
+    // size and next to the thing they change.
+
+    private fun rememberStickResponse() {
+        editDeadzone = controllerView.stickDeadzone
+        editCurve = controllerView.stickCurve
+    }
+
+    private fun saveStickResponse() {
+        getPreferences(MODE_PRIVATE).edit()
+            .putFloat(PREF_STICK_DEADZONE, controllerView.stickDeadzone)
+            .putFloat(PREF_STICK_CURVE, controllerView.stickCurve)
+            .apply()
+    }
+
+    private fun restoreStickResponse() {
+        controllerView.stickDeadzone = editDeadzone
+        controllerView.stickCurve = editCurve
     }
 
     @SuppressLint("MissingPermission")
@@ -884,6 +1027,8 @@ class MainActivity : AppCompatActivity(),
                 getString(R.string.status_connect_refused, deviceName ?: "that device")
             HidGamepadManager.HidStatus.PROFILE_UNAVAILABLE ->
                 getString(R.string.status_profile_unavailable)
+            HidGamepadManager.HidStatus.RECONNECTING ->
+                getString(R.string.status_reconnecting, deviceName ?: "…")
         }
         statusView.setTextColor(STATUS_DIM)
     }
@@ -898,6 +1043,10 @@ class MainActivity : AppCompatActivity(),
         statusView.text = getString(R.string.status_connected, name)
         statusView.setTextColor(STATUS_CONNECTED)
         controllerView.linkState = ControllerView.LinkState.CONNECTED
+        // A real controller reports where it stands the moment the link comes
+        // up. Sending the current state also clears anything the host still
+        // believes is held from before the drop.
+        sendMerged()
         if (!tvNavigation) hidManager.sendKey(HidConstants.KEY_NONE)
         device?.let {
             getPreferences(MODE_PRIVATE).edit()
@@ -914,12 +1063,15 @@ class MainActivity : AppCompatActivity(),
 
     private companion object {
         const val REQUEST_BLUETOOTH = 101
+        const val REFRESH_POLL_MS = 1000L
         const val PREF_TV_NAV = "tv_navigation"
         const val PREF_BG_X = "background_pan_x"
         const val PREF_BG_Y = "background_pan_y"
         const val PREF_LAST_DEVICE = "last_device_address"
         const val PREF_SKIN = "controller_skin"
         const val PREF_HAPTICS = "haptics_level"
+        const val PREF_STICK_DEADZONE = "stick_deadzone"
+        const val PREF_STICK_CURVE = "stick_curve"
         const val STATUS_CONNECTED = 0xFF35C98A.toInt()
         const val STATUS_DIM = 0xFF8A8FA8.toInt()
     }

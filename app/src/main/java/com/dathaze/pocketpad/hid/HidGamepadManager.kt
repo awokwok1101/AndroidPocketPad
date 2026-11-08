@@ -11,8 +11,10 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Registers the phone as a Bluetooth HID gamepad (peripheral role) and
@@ -54,7 +56,10 @@ class HidGamepadManager(private val context: Context, private val listener: List
         CONNECT_REFUSED,
 
         /** The phone cannot talk to the Bluetooth stack — no profile proxy. */
-        PROFILE_UNAVAILABLE
+        PROFILE_UNAVAILABLE,
+
+        /** The link dropped and the app is trying to get it back by itself. */
+        RECONNECTING
     }
 
     interface Listener {
@@ -74,13 +79,36 @@ class HidGamepadManager(private val context: Context, private val listener: List
     }
 
     private var adapter: BluetoothAdapter? = null
-    private var hidDevice: BluetoothHidDevice? = null
-    private var connectedDevice: BluetoothDevice? = null
+    @Volatile private var hidDevice: BluetoothHidDevice? = null
+    @Volatile private var connectedDevice: BluetoothDevice? = null
     private var registered = false
     private var pendingConnect: BluetoothDevice? = null
     private var started = false
-    private var lastReport: ByteArray? = null
-    private var lastKey: Byte = HidConstants.KEY_NONE
+    // What each channel last delivered. A host may ask for the state instead of
+    // waiting for a change, and the answer has to be the real one — see
+    // [HidReportRequests.getReport].
+    @Volatile private var lastGamepadReport: ByteArray? = null
+    @Volatile private var lastKeyReport: ByteArray? = null
+
+    // Where to come back to after an unexpected drop. Cleared by [disconnect],
+    // so asking to disconnect is not immediately undone by the retry below.
+    @Volatile private var reconnectTarget: BluetoothDevice? = null
+    private var reconnectAttempts = 0
+    private val reconnectRunnable = Runnable { attemptReconnect() }
+
+    // The gamepad report is handed to a sending thread instead of being pushed
+    // from the caller (the UI thread): see [send] and [ReportCoalescer].
+    private val coalescer = ReportCoalescer()
+
+    /**
+     * Keys for TV navigation. Same queue, same sending thread, same rules: a
+     * key report sent from the touch path was a blocking binder call on the UI
+     * thread, which is the one thing this class exists to keep out of there.
+     */
+    private val keyCoalescer = ReportCoalescer()
+    private val senderLock = Any()
+    private var senderQueued = false
+    @Volatile private var sender: ExecutorService? = null
 
     val isConnected: Boolean get() = connectedDevice != null
     val currentDevice: BluetoothDevice? get() = connectedDevice
@@ -127,8 +155,16 @@ class HidGamepadManager(private val context: Context, private val listener: List
         connectedDevice = null
         registered = false
         started = false
-        lastReport = null
-        lastKey = HidConstants.KEY_NONE
+        reconnectTarget = null
+        reconnectAttempts = 0
+        mainHandler.removeCallbacks(reconnectRunnable)
+        synchronized(senderLock) {
+            coalescer.reset()
+            keyCoalescer.reset()
+            senderQueued = false
+        }
+        sender?.shutdown()
+        sender = null
         // The callback executor owns a live thread; let it go with the app.
         executor.shutdown()
     }
@@ -163,6 +199,10 @@ class HidGamepadManager(private val context: Context, private val listener: List
      * used to answer that by showing "connecting…" until the user gave up.
      */
     fun connectTo(device: BluetoothDevice) {
+        // A connection the user asked for replaces any retry in flight.
+        reconnectTarget = device
+        reconnectAttempts = 0
+        mainHandler.removeCallbacks(reconnectRunnable)
         val proxy = hidDevice
         if (proxy == null) {
             // No proxy yet: remember the request and get one.
@@ -190,6 +230,12 @@ class HidGamepadManager(private val context: Context, private val listener: List
     }
 
     fun disconnect() {
+        // An explicit disconnect has to stay disconnected. The target is
+        // cleared before the stack reports the drop, because that report is
+        // what arms the retry.
+        reconnectTarget = null
+        reconnectAttempts = 0
+        mainHandler.removeCallbacks(reconnectRunnable)
         val proxy = hidDevice ?: return
         try {
             connectedDevice?.let { proxy.disconnect(it) }
@@ -198,43 +244,188 @@ class HidGamepadManager(private val context: Context, private val listener: List
     }
 
     /**
-     * Send the current gamepad state to the connected host. Identical
-     * back-to-back reports are dropped so the radio only carries changes —
-     * lower latency and less battery.
+     * Come back from a drop without the user having to open the menu.
+     *
+     * A controller link does not only end when someone turns the TV off: a TV
+     * entering standby, an input switch, or a burst of 2.4 GHz interference all
+     * drop it. Until now the app answered that by sitting on "Disconnected"
+     * until the user went into Settings → Connect to a paired device, which is
+     * the difference between a controller that recovers in a second and one
+     * that looks broken.
+     *
+     * Retries back off and stop after [MAX_RECONNECT_ATTEMPTS], so a host that
+     * is switched off or out of range does not keep the radio awake for ever.
+     * [disconnect] and a fresh [connectTo] cancel this.
      */
-    fun send(state: GamepadState) {
+    private fun scheduleReconnect() {
+        val target = reconnectTarget ?: return
+        if (!started) return
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            // Out of attempts. Saying "reconnecting" any longer would be a lie.
+            post { listener.onHidDisconnected() }
+            return
+        }
+        val index = reconnectAttempts.coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)
+        reconnectAttempts++
+        mainHandler.removeCallbacks(reconnectRunnable)
+        mainHandler.removeCallbacks(connectWatchdog)
+        post { listener.onHidStatus(HidStatus.RECONNECTING, safeName(target)) }
+        mainHandler.postDelayed(reconnectRunnable, RECONNECT_DELAYS_MS[index])
+    }
+
+    private fun attemptReconnect() {
+        val target = reconnectTarget ?: return
         val proxy = hidDevice ?: return
-        val device = connectedDevice ?: return
-        val report = state.toReport()
-        if (lastReport?.contentEquals(report) == true) return
+        if (!started || !registered || connectedDevice != null) return
+        val adapter = adapter ?: systemAdapter() ?: return
+        if (!adapter.isEnabled) return
         try {
-            // Only remember what the stack accepted. Caching a refused report would make the
-            // next identical state look like a duplicate and get dropped, so a button whose
-            // press was lost could stay pressed on the host until something else moved.
-            if (proxy.sendReport(device, HidConstants.REPORT_ID, report)) {
-                lastReport = report
+            if (!proxy.connect(target)) {
+                scheduleReconnect()
+            } else {
+                // True only means the stack took the request; the host still
+                // has to answer. If it never does, nothing else would retry.
+                mainHandler.postDelayed(connectWatchdog, CONNECT_WATCHDOG_MS)
             }
         } catch (_: SecurityException) {
         }
     }
 
+    /** A connect request the host never answered must not end the retrying. */
+    private val connectWatchdog = Runnable {
+        if (connectedDevice == null) scheduleReconnect()
+    }
+
+    /**
+     * Send the current gamepad state to the connected host.
+     *
+     * Returns immediately: the report is left with [coalescer] and a sending
+     * thread picks it up. `sendReport` is a synchronous binder call into the
+     * Bluetooth stack that blocks while the radio's queue is full, so waiting
+     * for it here — on the thread that is also drawing the pad and handling the
+     * next touch — is how one slow host turns into a stuttering controller. If
+     * reports arrive faster than the radio takes them, only the newest survives:
+     * the host gets the current state rather than a queue of old ones.
+     *
+     * Identical consecutive states are still dropped, so the radio carries
+     * changes rather than a constant stream.
+     */
+    fun send(state: GamepadState) {
+        if (hidDevice == null || connectedDevice == null) return
+        val report = state.toReport()
+        synchronized(senderLock) {
+            coalescer.offer(report)
+        }
+        kickSender()
+    }
+
+    /** Make sure exactly one sending task is on its way. */
+    private fun kickSender() {
+        synchronized(senderLock) {
+            if (senderQueued) return
+            senderQueued = true
+        }
+        try {
+            liveSender().execute { drainReports() }
+        } catch (_: RejectedExecutionException) {
+            // Shutting down: the sender is gone and there is nothing left to
+            // deliver. Clear the flag so a later [send] can start a new one
+            // instead of believing a task is already queued.
+            synchronized(senderLock) { senderQueued = false }
+        }
+    }
+
+    /** Runs on the sending thread until the newest report has been handed over. */
+    private fun drainReports() {
+        try {
+            while (true) {
+                // Gamepad first: when both are waiting it is the one the game is
+                // reading, and only one key can ever be queued behind it.
+                val gamepad = synchronized(senderLock) { coalescer.take() }
+                val key = if (gamepad == null) {
+                    synchronized(senderLock) { keyCoalescer.take() }
+                } else {
+                    null
+                }
+                val report = gamepad ?: key ?: break
+                val reportId =
+                    if (gamepad != null) HidConstants.REPORT_ID
+                    else HidConstants.REPORT_ID_KEYBOARD
+                val proxy = hidDevice ?: continue
+                val device = connectedDevice ?: continue
+                val delivered = try {
+                    proxy.sendReport(device, reportId, report)
+                } catch (_: SecurityException) {
+                    false
+                }
+                if (delivered) {
+                    if (gamepad != null) lastGamepadReport = report else lastKeyReport = report
+                    continue
+                }
+
+                // Refused, not delivered: put it back at the front of the queue,
+                // so the press the player is waiting for is the next thing tried
+                // rather than being taken for a duplicate and dropped.
+                synchronized(senderLock) {
+                    if (gamepad != null) coalescer.failed(report) else keyCoalescer.failed(report)
+                }
+                // The radio's queue is full. Trying again straight away would
+                // spin this thread on the same refused report and take the CPU
+                // the radio needs in order to drain — the stall this thread
+                // exists to prevent, just moved off the UI thread. Anything
+                // newer that arrives meanwhile replaces the retry anyway.
+                try {
+                    Thread.sleep(REFUSED_RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+        } finally {
+            val moreToDo = synchronized(senderLock) {
+                senderQueued = false
+                coalescer.hasPending() || keyCoalescer.hasPending()
+            }
+            // A report can land between the loop finding nothing and the flag
+            // being cleared; that one would otherwise wait for the next touch.
+            if (moreToDo) kickSender()
+        }
+    }
+
+    private fun liveSender(): ExecutorService {
+        val current = sender
+        if (current != null && !current.isShutdown) return current
+        // A report that leaves late is a press the player feels late. This
+        // thread does nothing but hand reports to the radio, so it runs at
+        // display priority rather than queueing behind background work for the
+        // CPU — scheduling jitter here is latency the app adds by itself.
+        val created = Executors.newSingleThreadExecutor { task ->
+            Thread({
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+                task.run()
+            }, "pocketpad-hid-send")
+        }
+        sender = created
+        return created
+    }
+
     /**
      * Send a keyboard key (or [HidConstants.KEY_NONE] to release) so the pad
-     * can drive TV menus. Repeats are suppressed like gamepad reports.
+     * can drive TV menus. Queued like the gamepad reports, not sent here: this
+     * runs on the thread that draws the pad and reads the next touch, and
+     * `sendReport` is a binder call that blocks while the radio's queue is full.
+     *
+     * Repeats are still suppressed — the queue drops a state identical to the
+     * one the host is already heading for. A press and its release can arrive
+     * within one radio turnaround, which is exactly why the queue keeps two
+     * states: a single slot would let the release overwrite the press and the
+     * menu would never open.
      */
     fun sendKey(key: Byte) {
-        val proxy = hidDevice ?: return
-        val device = connectedDevice ?: return
-        if (key == lastKey) return
-        try {
-            // Cached only on success, for the same reason as the gamepad report above: a
-            // dropped release would leave the key held.
-            val sent = proxy.sendReport(
-                device, HidConstants.REPORT_ID_KEYBOARD, HidConstants.keyboardReport(key)
-            )
-            if (sent) lastKey = key
-        } catch (_: SecurityException) {
-        }
+        if (hidDevice == null || connectedDevice == null) return
+        val report = HidConstants.keyboardReport(key)
+        synchronized(senderLock) { keyCoalescer.offer(report) }
+        kickSender()
     }
 
     private val serviceListener = object : BluetoothProfile.ServiceListener {
@@ -336,15 +527,30 @@ class HidGamepadManager(private val context: Context, private val listener: List
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevice = device
+                    // Whatever brought us here — the host, the user, or the
+                    // retry below — this is the device to come back to, and
+                    // the attempt counter starts again.
+                    reconnectTarget = device
+                    reconnectAttempts = 0
+                    mainHandler.removeCallbacks(reconnectRunnable)
+                    mainHandler.removeCallbacks(connectWatchdog)
                     post { listener.onHidConnected(device) }
                 }
                 BluetoothProfile.STATE_CONNECTING ->
                     post { listener.onHidStatus(HidStatus.CONNECTING, safeName(device)) }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (connectedDevice == device) connectedDevice = null
-                    lastReport = null
-                    lastKey = HidConstants.KEY_NONE
+                    synchronized(senderLock) {
+                        coalescer.reset()
+                        keyCoalescer.reset()
+                    }
+                    lastGamepadReport = null
+                    lastKeyReport = null
                     post { listener.onHidDisconnected() }
+                    // Only the device we are meant to be on: a refused or
+                    // abandoned attempt at some other host must not start a
+                    // retry loop against the wrong one.
+                    if (device == reconnectTarget) scheduleReconnect()
                 }
             }
         }
@@ -357,8 +563,13 @@ class HidGamepadManager(private val context: Context, private val listener: List
         override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {
             val proxy = hidDevice ?: return
             try {
+                val current = when (id.toInt() and 0xFF) {
+                    HidConstants.REPORT_ID -> lastGamepadReport
+                    HidConstants.REPORT_ID_KEYBOARD -> lastKeyReport
+                    else -> null
+                }
                 val outcome = HidReportRequests.getReport(
-                    type, id, bufferSize, BluetoothHidDevice.REPORT_TYPE_INPUT
+                    type, id, bufferSize, BluetoothHidDevice.REPORT_TYPE_INPUT, current
                 )
                 when (outcome) {
                     is HidRequestOutcome.Reply ->
@@ -415,6 +626,19 @@ class HidGamepadManager(private val context: Context, private val listener: List
          */
         const val SUBCLASS: Byte = BluetoothHidDevice.SUBCLASS1_COMBO
         const val MAX_REREGISTER_ATTEMPTS = 4
+
+        /** Five tries spread over ~15 s: long enough for a TV to finish waking. */
+        const val MAX_RECONNECT_ATTEMPTS = 5
+        val RECONNECT_DELAYS_MS = longArrayOf(500L, 1000L, 2000L, 4000L, 8000L)
+
+        /** How long to wait for a host to answer a connect request before retrying. */
+        const val CONNECT_WATCHDOG_MS = 4000L
+
+        /**
+         * Pause after the radio refuses a report. `sendReport` returns false when
+         * its queue is full; retrying on the next instruction would spin.
+         */
+        const val REFUSED_RETRY_DELAY_MS = 10L
 
         /**
          * Whether to ask for a custom L2CAP flow spec instead of the stack default.

@@ -20,6 +20,7 @@ That is the main thing separating PocketPad from most "phone as controller" proj
 - [Pairing](#pairing)
 - [Physical controller passthrough](#physical-controller-passthrough)
 - [How it works](#how-it-works)
+- [Latency](#latency)
 - [Architecture](#architecture)
 - [Building](#building)
 - [Compatibility and known limitations](#compatibility-and-known-limitations)
@@ -75,6 +76,8 @@ CI also refuses to publish an APK that is not signed with the repository's commi
 
 Releases published before this existed carry no `version.json`; the app says so plainly rather than guessing, and the next build fixes it.
 
+**Every build carries a new version.** `versionCode` and `versionName` in `app/build.gradle` are bumped with each set of changes (2.7.0 is code 21), so Android shows a different version in the app's info page and the in-app updater has something newer to offer. A build that reused a version number would look identical to the phone that already has it.
+
 **Your first 2.4.0 install has to be by hand.** The build before it has no Check for updates button, so nothing in it can fetch one. Download the APK once from the link above; updates after that come from inside the app. [docs/UPDATE_TESTING.md](docs/UPDATE_TESTING.md) has the full procedure.
 
 ---
@@ -87,7 +90,9 @@ Releases published before this existed carry no `version.json`; the app says so 
 |---|---|
 | **Controls** | 8-way d-pad, four face buttons, dual analog sticks, four shoulder buttons/triggers, two stick-click buttons, Select/Start-style pair, and a central Home button |
 | **Multitouch** | Every control is hit-tested independently, so several fingers work at once |
-| **Orientation** | Separate portrait and landscape layouts for each style |
+| **Orientation** | Opens in landscape and follows the sensor; each style also has its own portrait layout for when a phone is set to rotate |
+| **Fullscreen** | System bars hidden, and the window draws into the camera cutout instead of being kept clear of it, so the pad reaches every edge |
+| **Refresh rate** | The panel's live rate (for example **120 Hz**) shown in the top corner — the ceiling on how often a touch can reach the pad |
 | **Rendering** | Drawn directly to a `Canvas` — shaded caps with sockets, bevels and press states, a one-piece pivoting d-pad, and domed thumbsticks |
 | **Haptics** | Per-press vibration with **Strong / Light / Off** levels, using the platform's predefined click and tick effects where available |
 | **Safe area** | Controls and the status pill lay out inside the display cutout and system-bar insets |
@@ -106,16 +111,17 @@ Five styles, switchable from the ⚙ menu. Every style drives the **same** HID r
 
 ### Customisation
 
-- **Move buttons** — drag any control anywhere on screen, then **Save**. Layouts are stored **per style and per orientation**, so a custom landscape PlayStation layout does not disturb the portrait one. **Default** restores the built-in layout; **Cancel** discards edits.
+- **Move and resize buttons** — drag any control anywhere on screen. To resize, tap a control and its panel opens: **SIZE**, **WIDTH** and **HEIGHT** tracks, each with a live percentage, plus the two stick settings when the control is a stick. Drag a track left or right with one finger, or pinch the control with two fingers for SIZE. SIZE is the two axes together (50–200%); WIDTH and HEIGHT move on their own (50–250%) so a button can be made long and thin or short and wide, and the drawn shape becomes that oval — the touch area follows it, not the circle it came from. A stretched stick still tracks the thumb exactly: its deflection is measured in the button's own (unstretched) space, so pushing up sends up. Labels, d-pad geometry and stick travel scale with it. Layouts are stored **per style and per orientation**, so a custom landscape PlayStation layout does not disturb the portrait one — and sizes, both axes included, are saved with the positions. **Default** restores the built-in layout; **Cancel** discards edits. Older saved layouts still load: three-field layouts keep their places at their original size, four-field ones keep their size and load round. Sizes apply to one control at a time, so enlarging a face button does not push its neighbours aside — move those too if they crowd.
 - **Background picture** — pick any image through Android's system photo picker (no storage permission required). The image is copied into app storage, downsampled to roughly screen resolution before decoding, then drawn *beneath* the controls with a dark scrim between, so no photo can obscure a button. Drag to frame it; the framing is remembered.
 - **Vibration level** — Strong / Light / Off.
+- **Stick response** — a deadzone (0–40%) and a response curve (1.0–2.0×) for both sticks, edited where the sticks are: ⚙ → *Edit layout*, tap a stick, and the panel that opens carries **DEADZONE** and **CURVE** rows under **SIZE**, **WIDTH** and **HEIGHT**. Buttons do not get them, because buttons are on or off and have no travel to shape; the two analog sticks are the only controls these settings touch. Both are **off by default**, which is exactly what earlier builds did. The deadzone is radial, not per-axis: movement shorter than it sends nothing, and the remaining travel is rescaled so the stick still reaches full speed at the edge — a deadzone that clips the maximum would turn every game's run into a walk. The curve adjusts how much of the travel sits near the centre, after the deadzone is removed, so fine aim gets easier without losing the edge. Both are applied to the deflection before the report is built, so the cap drawn on screen and the value the host receives cannot disagree. SAVE stores them with the layout, CANCEL puts the previous values back, and DEFAULT returns them to off.
 - **TV menu keys** — an opt-in mode, **off by default**, in which the pad additionally sends keyboard keys (arrows, Enter, Escape) so it can drive a TV's menus. It is off by default because while a game is running those keys are duplicate input, and Escape is read as "quit" by some clients.
 
 ### Connection
 
 - **Long-press Home** to enter pairing mode without opening a menu.
 - A **status ring** around the Home button shows link state: dim when idle, pulsing while the phone is discoverable, solid green when connected. A status pill at the top of the screen shows the same in words.
-- **Reconnect** — the last connected device's address is saved and reconnected on launch.
+- **Reconnect** — the last connected device's address is saved and reconnected on launch, and an unexpected drop is retried by itself: five attempts backing off from 0.5 s to 8 s, stopped the moment the host answers. *Disconnect* in the menu still means disconnected.
 - **Paired-device picker** — reconnect to any bonded device from a list.
 
 ---
@@ -172,15 +178,64 @@ Thirteen buttons are mapped in the standard gamepad order — A/B/X/Y, bumpers, 
 
 The keyboard collection serves two purposes: it lets the pad drive a host's menus as arrow keys when the user opts in, and it gives hosts that ignore a bare gamepad a familiar profile to enumerate.
 
-**Quality of service.** Registration requests a low-latency QoS profile (best-effort service with a small token bucket and a tight latency budget) rather than accepting the default.
+**Quality of service.** Registration asks for nothing unusual: the stack's default outgoing QoS. A custom low-latency flow spec — best-effort service, ~11 ms latency budget — is one constant away (`REQUEST_CUSTOM_QOS`), but it is not requested by default because a flow spec is negotiated while the L2CAP channel is configured, and a host that dislikes the one being asked for can refuse the channel instead of falling back. It was never measured to help; the delay users actually noticed came from elsewhere, below.
 
-**Report transmission.** Input reports are sent on state change only — an identical back-to-back report is dropped, for both the gamepad and keyboard collections, so the radio carries changes rather than a constant stream. Presses are transmitted *before* haptics fire, since the vibrator call does not return instantly. When the host polls with a Get_Report the app replies with a neutral report so the host never stalls, and Set_Report is acknowledged.
+**Report transmission.** Input reports are sent on state change only — an identical back-to-back report is dropped, for both the gamepad and keyboard collections, so the radio carries changes rather than a constant stream. A burst of changes is trimmed to what the host still needs: the oldest state it has not been sent yet and the newest, so a press is never lost behind the release that follows it and the host is never reading input from more than one radio turnaround ago. Presses are transmitted *before* haptics fire, since the vibrator call does not return instantly. When the host polls with a Get_Report the app replies with **the state it last sent** for that collection — a host that polls instead of listening for changes is asking what the pad is doing now, and the neutral report it used to get would release every button the user was holding. Before anything has been sent, neutral is still the answer; Set_Report is acknowledged because this descriptor declares no output or feature report, and answering with the collection the host actually asked for keeps a keyboard poll from being read as gamepad bytes.
+
+**Sending happens off the UI thread.** `sendReport` is a synchronous binder call into the Bluetooth stack, and it blocks while the radio's queue is full. Calling it from the thread that draws the pad and reads the next touch meant one sluggish host froze the controller itself, and any reports queued behind the stall described where the stick *had been* — the longer the host stalled, the further behind the picture got. Reports are now handed to a single sending thread, which keeps at most two states ([`ReportCoalescer`](app/src/main/java/com/dathaze/pocketpad/hid/ReportCoalescer.kt)): the oldest one the host has not been sent yet, and the newest, so a backlog cannot form while a press is still not lost behind the release that came a millisecond later. Sending A → B → A still delivers all three, because a report is only dropped when the host is already heading for that exact state. Keyboard reports for TV navigation go through a queue of their own on the same sending thread: they used to be sent from the touch path, which put a blocking binder call back on the UI thread exactly when a press had to be read. A press and its release can arrive within a frame, and the two-state queue is what keeps the release from overwriting the press.
 
 **Connection management.** The profile is exclusive: another app taking the HID Device role knocks PocketPad out. When registration is reported lost, the app schedules a backed-off re-registration (up to a bounded number of attempts) instead of stranding the user with a dead pad, and returning to the app also triggers recovery. Disconnects clear the cached report state so the next connection starts clean.
 
 **Lifecycle and permissions.** `BLUETOOTH_CONNECT` and `BLUETOOTH_ADVERTISE` are requested at runtime on Android 12+; the legacy Bluetooth permissions are capped at API 30 in the manifest. Every permission-guarded Bluetooth call is wrapped, so a revoked permission surfaces as a status message rather than a crash. Bluetooth being off at launch is recoverable — the app retries when you return to it. The discoverability prompt's result is checked, so the pairing indicator reflects what the system actually granted rather than assuming the user accepted.
 
 **Input integrity.** Android reuses pointer IDs, so a control still holding an incoming ID is released before the ID is reassigned; the last finger lifting releases everything; and losing window focus mid-press (notification shade, incoming call) releases held controls. Without these a button could stay transmitted as held indefinitely.
+
+---
+
+## Latency
+
+Short answer: **there is always some delay over Bluetooth, and most of it is not the app's to remove.** What PocketPad controls is that it adds as little as possible on top.
+
+### Where the delay comes from
+
+| Stage | Typical cost | Whose it is |
+|---|---|---|
+| Touch → report built | under a millisecond | app |
+| Report → radio → host | **~10–30 ms** with a cooperative host; cheap TV firmware can be slower | Bluetooth stack + host |
+| Host input handling → game reacts | a few ms, to **50–150 ms** if the TV is not in game mode | host |
+
+Bluetooth HID is a **polled** link: the host asks the pad for input on its own schedule, and nothing the pad sends can arrive sooner than the next poll. A host that polls lazily adds that interval to every button press. On top of that, many TVs run image processing that delays what you *see* long after the input arrived — the same TV lags with a wired controller, just less.
+
+### What the app does about it
+
+- Sends on **change only**, so the radio is never busy repeating a still state.
+- Sends **off the UI thread**, keeping at most two states, so a stalled host cannot freeze the pad or make it fall behind. Two rather than one because a tap can press and release inside a single radio turnaround: with one slot the release overwrote the press and the button never fired, which is exactly what made fast play feel unresponsive. Anything older than two states is dropped — the radio is never fed a backlog.
+- Asks Android for **unbuffered touch dispatch**. By default the input system hands the app one motion event per frame, so every press already carried up to a frame of delay before the app read it. Unbuffered dispatch delivers events as they happen; it is the largest latency item the app itself can remove, and it is re-requested on every new touch.
+- Reports **one state per touch event**, after every finger in that event has been applied, instead of one per control that moved — a host is given the state the event actually produced, not half-updated ones ahead of it.
+- Runs that sending thread at **display priority**, so background work on the phone cannot make a report wait for the CPU.
+- Asks the window for the **fastest refresh rate the panel supports**. Touch events arrive once per frame, so on a 60 Hz panel a press can wait up to ~16 ms just to be handed to the app — at 120 Hz that halves. It is a request: a 60 Hz panel has nothing faster, battery saver ignores it, and a mode with a different resolution is never picked, so the layout cannot shift. The corner readout shows the rate the screen actually settled on, refreshed every second — a phone that drops back to 60 Hz for heat or battery says so there instead of leaving you to guess why presses feel slower.
+- **Waits instead of spinning** when the radio refuses a report because its queue is full — retrying immediately would take the CPU the radio needs in order to drain.
+- **Reconnects by itself** after a drop, with backoff, instead of sitting on “Disconnected” until someone opens the menu.
+- Fires **haptics after** the report goes out, so the buzz never delays the press.
+- Asks for the stack's **default QoS**, since a custom flow spec can be refused outright (see *Quality of service* above).
+- Merges a plugged-in controller straight into the same report, so passthrough adds no second hop.
+- States its position the moment the link comes up, the way a real controller does, so nothing the host still believes is held survives a reconnect.
+
+### What you can do on the host side
+
+- Turn **game mode / low latency mode** on for the HDMI input. This is usually the single biggest win — often larger than everything Bluetooth adds.
+- Keep the phone **within a couple of metres, in line of sight**, and avoid holding it against your body; a hand over the antenna costs more than any code change.
+- Prefer **5 GHz Wi-Fi**, or move other 2.4 GHz traffic (wireless mouse, baby monitor, second controller) away: Bluetooth and 2.4 GHz Wi-Fi share the same band.
+- Disconnect **idle Bluetooth audio devices** on the TV if it lets you.
+- If your TV has a **Bluetooth audio** device connected, expect more delay: audio links usually get radio priority over HID.
+
+### Telling the app's delay from the host's
+
+- The **buzz is immediate but the TV reacts late** → the delay is after the phone (radio scheduling or the host). Nothing in the app can fix it.
+- **The TV's own remote also feels sluggish** in menus → the TV is the problem, not the pad.
+- **Everything is late, including the buzz** → the phone is busy; report it, because that would be an app bug.
+
+Numbers above are the expected ranges for Bluetooth Classic HID, not measurements taken from this repository — the project has no way to time a round trip through a host it does not control. If you measure yours, a real figure is more useful than the table.
 
 ---
 
@@ -193,6 +248,7 @@ app/src/main/java/com/dathaze/pocketpad/
 ├── hid/
 │   ├── HidConstants.kt        # Composite HID report descriptor, button map, key codes
 │   ├── GamepadState.kt        # 9-byte report model + merge rules
+│   ├── ReportCoalescer.kt     # Newest-report-wins hand-off to the sending thread
 │   └── HidGamepadManager.kt   # BluetoothHidDevice: registration, SDP, QoS, connection
 │                              # lifecycle, re-registration recovery, report sending
 ├── usb/
@@ -206,6 +262,9 @@ app/src/main/java/com/dathaze/pocketpad/
 │   └── UpdateFlow.kt          # The Check-for-updates dialog and its thread
 └── ui/
     ├── ControllerView.kt      # Canvas gamepad: 5 styles, layout editor, backgrounds
+    ├── LayoutStorage.kt       # Saved layout format (position + size, per style/orientation)
+    ├── ResizeSlider.kt        # Maps a horizontal drag on the size panel to a multiplier
+    ├── StickResponse.kt       # Radial deadzone + response curve for both sticks
     └── Haptics.kt             # Vibration levels
 ```
 

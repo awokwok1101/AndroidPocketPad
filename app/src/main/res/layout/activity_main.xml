@@ -60,4 +60,25 @@
         android:textSize="12sp"
         android:text="@string/status_idle" />
 
+    <!--
+      The rate the panel is running at, live. It is the ceiling on how often a touch can reach
+      the pad, so it is worth being able to see: the app asks for the fastest mode the screen
+      offers, and this is where that request is visible. Purely a readout — it takes no touches.
+    -->
+    <TextView
+        android:id="@+id/refreshRate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal|top"
+        android:layout_marginTop="34dp"
+        android:alpha="0.8"
+        android:background="@drawable/status_pill"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:textColor="@color/pp_text_dim"
+        android:textSize="12sp"
+        android:text="—" />
+
 </FrameLayout>

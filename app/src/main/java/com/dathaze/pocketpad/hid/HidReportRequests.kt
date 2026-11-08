@@ -35,16 +35,27 @@ object HidReportRequests {
      * Answer a Get_Report. [bufferSize] is how much room the host allocated;
      * a smaller buffer truncates rather than overruns, and a non-positive
      * value is treated as "no limit given".
+     *
+     * [current] is the report the pad last sent for this id, if there is one.
+     * A host that polls instead of listening for changes is asking what the pad
+     * is doing *now*, and that is what a real controller answers. Replying with
+     * the neutral report instead would tell the host that every button is
+     * released while the user is holding one — a dropped input that no amount
+     * of speed elsewhere can undo.
      */
     fun getReport(
         type: Byte,
         reportId: Byte,
         bufferSize: Int,
-        inputReportType: Byte
+        inputReportType: Byte,
+        current: ByteArray? = null
     ): HidRequestOutcome {
         if (!isInputType(type, inputReportType)) return HidRequestOutcome.UnsupportedType
-        val report = HidConstants.neutralReportFor(reportId.toInt() and 0xFF)
+        val neutral = HidConstants.neutralReportFor(reportId.toInt() and 0xFF)
             ?: return HidRequestOutcome.UnknownReportId
+        // A state of the wrong length does not belong to this report id; the
+        // neutral one is the only safe answer then.
+        val report = current?.takeIf { it.size == neutral.size } ?: neutral
         val payload =
             if (bufferSize in 1 until report.size) report.copyOf(bufferSize) else report
         return HidRequestOutcome.Reply(payload)

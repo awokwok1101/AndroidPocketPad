@@ -15,6 +15,7 @@ import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import kotlin.math.PI
@@ -56,6 +57,42 @@ class ControllerView @JvmOverloads constructor(
     /** Connection state shown by the halo around the PS/home button. */
     enum class LinkState { IDLE, DISCOVERABLE, CONNECTED }
 
+    companion object {
+        /**
+         * Range a control may be pinched to, relative to its built-in size.
+         * The floor keeps a button findable with a fingertip; the ceiling
+         * keeps one control from swallowing its neighbour's touches.
+         */
+        const val MIN_CONTROL_SCALE = 0.5f
+        const val MAX_CONTROL_SCALE = 2.0f
+
+        /**
+         * Range for width and height on their own. Wider than the uniform
+         * range in both directions: a long thin button is the point of being
+         * able to set the two axes separately.
+         */
+        const val MIN_AXIS_SCALE = 0.5f
+        const val MAX_AXIS_SCALE = 2.5f
+
+        /** Step the width and height sliders settle on. */
+        private const val AXIS_STEP = 0.05f
+
+        // Rows of the edit panel. The first three every control has; the last
+        // two belong to a stick, because a button has no travel to shape.
+        private const val ROW_SIZE = 0
+        private const val ROW_WIDTH = 1
+        private const val ROW_HEIGHT = 2
+        private const val ROW_DEADZONE = 3
+        private const val ROW_CURVE = 4
+
+        /**
+         * How far outside a held control a second finger may land and still
+         * start resizing it. Buttons are small next to two fingertips, so the
+         * grab area is deliberately wider than the control itself.
+         */
+        private const val PINCH_GRAB_TOLERANCE = 2.2f
+    }
+
     interface Listener {
         /** Touch state changed — read [touchState] and send a report. */
         fun onTouchStateChanged()
@@ -90,17 +127,71 @@ class ControllerView @JvmOverloads constructor(
             invalidate()
         }
 
+    /**
+     * Radius around each stick's centre, as a fraction of full travel, that
+     * reports nothing. See [StickResponse] for what happens outside it.
+     */
+    var stickDeadzone: Float = StickResponse.DEADZONE_DEFAULT
+        set(value) {
+            val clamped = value.coerceIn(StickResponse.DEADZONE_MIN, StickResponse.DEADZONE_MAX)
+            if (field == clamped) return
+            field = clamped
+            invalidate()
+        }
+
+    /** Response curve exponent for both sticks; 1 is linear. */
+    var stickCurve: Float = StickResponse.CURVE_DEFAULT
+        set(value) {
+            field = value.coerceIn(StickResponse.CURVE_MIN, StickResponse.CURVE_MAX)
+        }
+
     // ---------------------------------------------------------------- controls
 
     private abstract inner class Control {
         var cx = 0f
         var cy = 0f
         var radius = 0f
+
+        /**
+         * Radius the built-in layout gave this control. A pinch multiplies
+         * this rather than the live radius, so repeated pinches cannot
+         * compound and a saved size survives a relayout.
+         */
+        var baseRadius = 0f
+
+        /** Size multiplier applied by the user, 1 = the built-in size. */
+        var scale = 1f
+
+        /**
+         * Stretch on top of [radius], 1 = a circle. Width and height can be set
+         * on their own, so a button can be made long and thin to fill a gap a
+         * round one could not.
+         */
+        var scaleX = 1f
+        var scaleY = 1f
+
+        /** Half the drawn width and height: the radius after the stretch. */
+        val rx: Float get() = radius * scaleX
+        val ry: Float get() = radius * scaleY
+
+        /** How far the control reaches at its widest point. */
+        val maxRadius: Float get() = max(rx, ry)
+
         var pointerId = -1
         val pressed: Boolean get() = pointerId != -1
 
-        open fun contains(x: Float, y: Float): Boolean =
-            hypot((x - cx).toDouble(), (y - cy).toDouble()) <= radius * 1.15
+        // Second finger of a pinch, and the geometry it started from.
+        var secondPointerId = -1
+        var pinchStartSpan = 0f
+        var pinchStartRadius = 0f
+
+        open fun contains(x: Float, y: Float, tolerance: Float = 1.15f): Boolean {
+            // Measured in unstretched space, so a stretched button answers to
+            // the shape drawn on screen rather than to the circle it came from.
+            val dx = (x - cx) / scaleX
+            val dy = (y - cy) / scaleY
+            return hypot(dx.toDouble(), dy.toDouble()) <= radius * tolerance
+        }
 
         open fun onDown(x: Float, y: Float) {}
         open fun onMove(x: Float, y: Float) {}
@@ -207,7 +298,7 @@ class ControllerView @JvmOverloads constructor(
     ) : Control() {
         private val longPressRunnable = Runnable {
             if (linkState != LinkState.CONNECTED) {
-                haptics.press()
+                buzz()
                 listener?.onHomeLongPress()
             }
         }
@@ -218,7 +309,7 @@ class ControllerView @JvmOverloads constructor(
             // Transmit first, buzz second. The vibrator call takes a moment to
             // return, and doing it first delays the press reaching the host.
             notifyChanged()
-            haptics.press()
+            buzz()
             if (isHome) postDelayed(longPressRunnable, 700)
         }
 
@@ -311,8 +402,10 @@ class ControllerView @JvmOverloads constructor(
         }
 
         private fun update(x: Float, y: Float, first: Boolean) {
-            val dx = x - cx
-            val dy = y - cy
+            // Unstretched space: the cross can be wider than it is tall, and the
+            // direction under the thumb must still be the direction sent.
+            val dx = (x - cx) / scaleX
+            val dy = (y - cy) / scaleY
             val dist = hypot(dx.toDouble(), dy.toDouble())
             val newHat = if (dist < radius * 0.18) {
                 HidConstants.HAT_NEUTRAL
@@ -324,9 +417,9 @@ class ControllerView @JvmOverloads constructor(
             if (newHat != touchState.hat) {
                 touchState.hat = newHat
                 notifyChanged()
-                if (first) haptics.press() else haptics.tick()
+                if (first) buzz() else buzz(strong = false)
             } else if (first) {
-                haptics.press()
+                buzz()
             }
         }
 
@@ -467,7 +560,7 @@ class ControllerView @JvmOverloads constructor(
 
         override fun onDown(x: Float, y: Float) {
             update(x, y)
-            haptics.press()
+            buzz()
         }
 
         override fun onMove(x: Float, y: Float) = update(x, y)
@@ -479,19 +572,30 @@ class ControllerView @JvmOverloads constructor(
         }
 
         private fun update(x: Float, y: Float) {
-            var dx = x - cx
-            var dy = y - cy
+            // Unstretched space, so a stretched stick's cap still lands under
+            // the thumb and the deflection matches the direction pushed.
+            val dx = (x - cx) / scaleX
+            val dy = (y - cy) / scaleY
             val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
             val max = radius * 0.82f
-            if (dist > max && dist > 0f) {
-                dx *= max / dist
-                dy *= max / dist
-            }
-            knobX = dx
-            knobY = dy
+            if (max <= 0f) return
+
+            // One magnitude-and-direction pair decides both what the host
+            // receives and where the cap is drawn, so the picture cannot
+            // disagree with the input. Deadzone and curve are radial, which
+            // keeps a diagonal push straight and keeps full throw reachable.
+            val pushed = StickResponse.apply(
+                (dist / max).coerceAtMost(1f),
+                stickDeadzone,
+                stickCurve
+            )
+            val ux = if (dist > 0f) dx / dist else 0f
+            val uy = if (dist > 0f) dy / dist else 0f
+            knobX = ux * pushed * max
+            knobY = uy * pushed * max
             setAxes(
-                (128 + (dx / max) * 127).roundToInt().coerceIn(0, 255),
-                (128 + (dy / max) * 127).roundToInt().coerceIn(0, 255)
+                (128 + ux * pushed * 127f).roundToInt().coerceIn(0, 255),
+                (128 + uy * pushed * 127f).roundToInt().coerceIn(0, 255)
             )
         }
 
@@ -589,7 +693,7 @@ class ControllerView @JvmOverloads constructor(
     /** Settings gear — opens the connection/skin menu instead of sending input. */
     private inner class GearButton : Control() {
         override fun onDown(x: Float, y: Float) {
-            haptics.press()
+            buzz()
         }
 
         override fun onUp() {
@@ -626,7 +730,21 @@ class ControllerView @JvmOverloads constructor(
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
     }
+    private val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
     private val tmpRect = RectF()
+
+    private val density = resources.displayMetrics.density
+    private fun dp(value: Float) = value * density
+
+    /** Scratch rectangle for the size panel's geometry. */
+    private val sizePanelRect = RectF()
+
+    /** Travel below which a finger is tapping instead of dragging. */
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
     // Molded-plastic palette: lit crown, shadowed skirt, near-black socket.
     private val capLit = Color.parseColor("#474D69")
@@ -733,6 +851,30 @@ class ControllerView @JvmOverloads constructor(
     var isEditingLayout = false
         private set
 
+    // ------------------------------------------------------- size slider
+
+    /**
+     * Control whose size the slider is editing, if any. Set by tapping a
+     * button in edit mode and cleared by tapping empty space.
+     */
+    private var resizeTarget: Control? = null
+
+    /** Distance between panel rows; shorter on a short screen. Set by [sliderRect]. */
+    private var panelRowSpacing = 0f
+
+    /** Finger dragging the slider track, -1 when it is idle. */
+    private var sliderPointerId = -1
+
+    /** Which row of the panel that finger grabbed: 0 size, 1 deadzone, 2 curve. */
+    private var sliderRow = 0
+
+    // A finger down on a button becomes a tap (opening the slider) or a drag
+    // (moving the button) depending on whether it travels past the touch slop.
+    private var tapPointerId = -1
+    private var tapDownX = 0f
+    private var tapDownY = 0f
+    private var tapTarget: Control? = null
+
     // ------------------------------------------------- custom background
 
     private var bgBitmap: Bitmap? = null
@@ -785,21 +927,37 @@ class ControllerView @JvmOverloads constructor(
 
     fun enterLayoutEditMode() {
         releaseAllPointers()
+        clearSizeSelection()
         isEditingLayout = true
         invalidate()
     }
 
-    /** Persist the current positions for this skin + orientation and exit. */
+    /** Close the size panel and forget any half-finished gesture on it. */
+    private fun clearSizeSelection() {
+        resizeTarget = null
+        sliderPointerId = -1
+        sliderRow = 0
+        tapPointerId = -1
+        tapTarget = null
+    }
+
+    /** Persist the current positions and sizes for this skin + orientation. */
     fun saveEditedLayout() {
         val w = safeWidth()
         val h = safeHeight()
         if (w > 0 && h > 0) {
-            val serialized = controlKeys.entries.joinToString(";") { (key, c) ->
-                "$key:${(c.cx - offX) / w}:${(c.cy - offY) / h}"
+            val entries = controlKeys.map { (key, c) ->
+                LayoutStorage.Entry(
+                    key, (c.cx - offX) / w, (c.cy - offY) / h,
+                    c.scale, c.scaleX, c.scaleY
+                )
             }
-            layoutPrefs.edit().putString(layoutPrefKey(), serialized).apply()
+            layoutPrefs.edit()
+                .putString(layoutPrefKey(), LayoutStorage.encode(entries))
+                .apply()
         }
         isEditingLayout = false
+        clearSizeSelection()
         invalidate()
     }
 
@@ -813,6 +971,7 @@ class ControllerView @JvmOverloads constructor(
     /** Exit without saving; reload whatever was stored (or the default). */
     fun cancelLayoutEdit() {
         isEditingLayout = false
+        clearSizeSelection()
         relayout()
         invalidate()
     }
@@ -829,17 +988,18 @@ class ControllerView @JvmOverloads constructor(
 
     /** Re-apply a user-saved layout on top of the defaults. */
     private fun applySavedLayout() {
-        val saved = layoutPrefs.getString(layoutPrefKey(), null) ?: return
+        val saved = LayoutStorage.decode(layoutPrefs.getString(layoutPrefKey(), null))
+        if (saved.isEmpty()) return
         val w = safeWidth()
         val h = safeHeight()
-        for (entry in saved.split(';')) {
-            val parts = entry.split(':')
-            if (parts.size != 3) continue
-            val control = controlKeys[parts[0]] ?: continue
-            val fx = parts[1].toFloatOrNull() ?: continue
-            val fy = parts[2].toFloatOrNull() ?: continue
-            control.cx = offX + fx * w
-            control.cy = offY + fy * h
+        for (entry in saved) {
+            val control = controlKeys[entry.key] ?: continue
+            control.cx = offX + entry.x * w
+            control.cy = offY + entry.y * h
+            control.scale = entry.size.coerceIn(MIN_CONTROL_SCALE, MAX_CONTROL_SCALE)
+            control.radius = control.baseRadius * control.scale
+            control.scaleX = entry.width.coerceIn(MIN_AXIS_SCALE, MAX_AXIS_SCALE)
+            control.scaleY = entry.height.coerceIn(MIN_AXIS_SCALE, MAX_AXIS_SCALE)
         }
     }
 
@@ -943,9 +1103,20 @@ class ControllerView @JvmOverloads constructor(
                 control.pointerId = -1
                 control.onUp()
             }
+            releasePinch(control)
         }
+        sliderPointerId = -1
+        tapPointerId = -1
+        tapTarget = null
         touchState.reset()
         notifyChanged()
+    }
+
+    /** Forget the second finger and the geometry of an in-progress pinch. */
+    private fun releasePinch(control: Control) {
+        control.secondPointerId = -1
+        control.pinchStartSpan = 0f
+        control.pinchStartRadius = 0f
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -974,6 +1145,13 @@ class ControllerView @JvmOverloads constructor(
     private fun place(c: Control, x: Float, y: Float, r: Float) {
         c.cx = offX + x
         c.cy = offY + y
+        // The built-in size, remembered so a pinch scales it instead of
+        // compounding on every relayout; a saved size is re-applied on top by
+        // applySavedLayout().
+        c.baseRadius = r
+        c.scale = 1f
+        c.scaleX = 1f
+        c.scaleY = 1f
         c.radius = r
     }
 
@@ -1183,17 +1361,295 @@ class ControllerView @JvmOverloads constructor(
         ensureBackground()
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
         drawBackgroundImage(canvas)
-        for (control in activeControls) control.draw(canvas)
-        if (isEditingLayout) {
-            // Accent ring marks every control as grabbable.
+        for (control in activeControls) {
+            canvas.save()
+            stretchCanvas(canvas, control)
+            control.draw(canvas)
+            canvas.restore()
+        }
+        if (isEditingLayout) drawEditOverlay(canvas)
+    }
+
+    /**
+     * Edit-mode furniture: an accent ring around every control so they all read
+     * as grabbable, a brighter ring around the one being resized, and the size
+     * slider for that control.
+     */
+    private fun drawEditOverlay(canvas: Canvas) {
+        // The rings and the panel borrow strokePaint, whose width the stick
+        // travel ring also depends on — put it back before returning.
+        val ringWidth = strokePaint.strokeWidth
+        for (control in activeControls) {
+            val selected = control === resizeTarget
             strokePaint.color = accentColor
-            for (control in activeControls) {
-                strokePaint.alpha = if (control.pressed) 255 else 120
-                canvas.drawCircle(control.cx, control.cy, control.radius * 1.08f, strokePaint)
-            }
-            strokePaint.alpha = 255
+            strokePaint.alpha = if (selected || control.pressed) 255 else 120
+            strokePaint.strokeWidth = if (selected) dp(4f) else dp(2.5f)
+            val gap = if (selected) 1.16f else 1.08f
+            canvas.save()
+            stretchCanvas(canvas, control)
+            canvas.drawCircle(control.cx, control.cy, control.radius * gap, strokePaint)
+            canvas.restore()
+        }
+        strokePaint.alpha = 255
+        drawResizeMenu(canvas)
+        strokePaint.strokeWidth = ringWidth
+    }
+
+    /**
+     * The panel for the selected control: its name, then one row per setting —
+     * SIZE, WIDTH, HEIGHT, and for a stick DEADZONE and CURVE. Each row is a
+     * track whose knob shows where that setting sits. Dragging a track is the
+     * one-finger way to change it; the pinch is precise but awkward on small
+     * buttons, so both exist.
+     */
+    private fun drawResizeMenu(canvas: Canvas) {
+        val target = resizeTarget ?: return
+        if (target !in activeControls) return
+        val rect = sliderRect()
+        val corner = dp(16f)
+
+        panelPaint.color = withAlpha(Color.BLACK, 176)
+        canvas.drawRoundRect(rect, corner, corner, panelPaint)
+        strokePaint.color = withAlpha(accentColor, 190)
+        strokePaint.strokeWidth = dp(1.5f)
+        canvas.drawRoundRect(rect, corner, corner, strokePaint)
+
+        // The control's name; every setting it has is one of the rows below.
+        val titleBaseline = rect.top + dp(24f)
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.textSize = dp(13f)
+        textPaint.color = accentColor
+        canvas.drawText(controlName(target), rect.left + dp(18f), titleBaseline, textPaint)
+        textPaint.textAlign = Paint.Align.CENTER // the controls draw their labels centred
+
+        // Size is the two axes together; width and height move on their own so
+        // one button can be made long or squat without touching the others.
+        drawSliderRow(
+            canvas, rect, ROW_SIZE, "SIZE",
+            "${(target.scale * 100).roundToInt()}%",
+            ResizeSlider.fractionFor(target.scale, MIN_CONTROL_SCALE, MAX_CONTROL_SCALE)
+        )
+        drawSliderRow(
+            canvas, rect, ROW_WIDTH, "WIDTH",
+            "${(target.scaleX * 100).roundToInt()}%",
+            ResizeSlider.fractionFor(target.scaleX, MIN_AXIS_SCALE, MAX_AXIS_SCALE)
+        )
+        drawSliderRow(
+            canvas, rect, ROW_HEIGHT, "HEIGHT",
+            "${(target.scaleY * 100).roundToInt()}%",
+            ResizeSlider.fractionFor(target.scaleY, MIN_AXIS_SCALE, MAX_AXIS_SCALE)
+        )
+
+        // A stick has two settings a button does not: how far the thumb may move
+        // before the host hears anything, and how the rest of the travel is
+        // shaped. They belong on the stick's own panel — that is where the thing
+        // they change is visible — instead of buried in the settings menu.
+        if (target is Stick) {
+            drawSliderRow(
+                canvas, rect, ROW_DEADZONE, "DEADZONE",
+                "${(stickDeadzone * 100).roundToInt()}%",
+                ResizeSlider.fractionFor(
+                    stickDeadzone, StickResponse.DEADZONE_MIN, StickResponse.DEADZONE_MAX
+                )
+            )
+            drawSliderRow(
+                canvas, rect, ROW_CURVE, "CURVE",
+                "${(stickCurve * 10).roundToInt() / 10f}×",
+                ResizeSlider.fractionFor(
+                    stickCurve, StickResponse.CURVE_MIN, StickResponse.CURVE_MAX
+                )
+            )
         }
     }
+
+    /** How many settings the panel shows for [control]. */
+    private fun rowCount(control: Control): Int =
+        if (control is Stick) ROW_CURVE + 1 else ROW_HEIGHT + 1
+
+    /** Vertical position of row [row]'s track, counting from the top of the panel. */
+    private fun sliderTrackY(rect: RectF, row: Int): Float =
+        rect.top + dp(44f) + panelRowSpacing * row
+
+    /**
+     * One row: name on the left, live value on the right, and a track whose knob
+     * shows where the setting sits.
+     */
+    private fun drawSliderRow(
+        canvas: Canvas,
+        rect: RectF,
+        row: Int,
+        label: String,
+        value: String,
+        fraction: Float
+    ) {
+        val trackLeft = rect.left + dp(34f)
+        val trackRight = rect.right - dp(34f)
+        val trackY = sliderTrackY(rect, row)
+        val baseline = trackY - dp(20f)
+
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.textSize = dp(12f)
+        textPaint.color = accentColor
+        canvas.drawText(label, rect.left + dp(18f), baseline, textPaint)
+        textPaint.textAlign = Paint.Align.RIGHT
+        textPaint.color = withAlpha(Color.WHITE, 210)
+        canvas.drawText(value, rect.right - dp(18f), baseline, textPaint)
+
+        trackPaint.strokeWidth = dp(6f)
+        trackPaint.color = withAlpha(Color.WHITE, 46)
+        canvas.drawLine(trackLeft, trackY, trackRight, trackY, trackPaint)
+        val knobX = ResizeSlider.xAt(fraction, trackLeft, trackRight)
+        trackPaint.color = accentColor
+        canvas.drawLine(trackLeft, trackY, knobX, trackY, trackPaint)
+        panelPaint.color = accentColor
+        canvas.drawCircle(knobX, trackY, dp(9f), panelPaint)
+        panelPaint.color = withAlpha(Color.WHITE, 70)
+        canvas.drawCircle(knobX, trackY, dp(3.2f), panelPaint)
+        textPaint.textAlign = Paint.Align.CENTER
+    }
+
+    /** What the size panel calls [control]; face buttons use their own glyph. */
+    private fun controlName(control: Control): String = when (control) {
+        is PadButton -> control.label
+        is Dpad -> "D-PAD"
+        is Stick -> if (control.isLeft) "LEFT STICK" else "RIGHT STICK"
+        is GearButton -> "SETTINGS"
+        else -> "BUTTON"
+    }
+
+    /**
+     * Where the panel sits. It takes the side of the screen away from the
+     * control being resized, so it never covers the button whose size is
+     * changing, and the top slot stays clear of the SAVE / DEFAULT / CANCEL
+     * pill.
+     */
+    private fun sliderRect(): RectF {
+        val w = min(safeWidth() * 0.80f, dp(320f))
+        // One row per setting; a stick has two more than a button.
+        val rows = resizeTarget?.let { rowCount(it) } ?: 1
+        // Rows tighten on a short screen rather than pushing the panel off it.
+        val available = (height - safeTop - safeBottom - dp(96f) - dp(26f))
+            .coerceAtLeast(dp(120f))
+        panelRowSpacing = if (rows <= 1) {
+            dp(44f)
+        } else {
+            ((available - dp(44f) - dp(26f)) / (rows - 1)).coerceIn(dp(28f), dp(44f))
+        }
+        val h = dp(44f) + panelRowSpacing * (rows - 1) + dp(26f)
+        val left = safeLeft + (safeWidth() - w) / 2f
+        val target = resizeTarget
+        val top = if (target != null && target.cy > height * 0.55f) {
+            safeTop + dp(96f)
+        } else {
+            height - safeBottom - dp(26f) - h
+        }
+        // Reused: the panel is drawn every frame while it is open, and none of
+        // its callers keep the rectangle past their own use of it.
+        sizePanelRect.set(left, top, left + w, top + h)
+        return sizePanelRect
+    }
+
+    /**
+     * The row of the panel under ([x], [y]) — see the ROW_ constants — or -1
+     * when the finger is not on it. A row is chosen by which track is nearest
+     * vertically, so grabbing slightly above or below a knob still works.
+     */
+    private fun sliderRowAt(x: Float, y: Float): Int {
+        val target = resizeTarget ?: return -1
+        if (target !in activeControls) return -1
+        val rect = sliderRect()
+        val margin = dp(10f)
+        if (x < rect.left - margin || x > rect.right + margin) return -1
+        if (y < rect.top - margin || y > rect.bottom + margin) return -1
+        val rows = rowCount(target)
+        var best = -1
+        // Half a row: the nearest track wins, so grabbing a little above or
+        // below a knob still finds it, and two tracks can never both match.
+        var bestDistance = dp(22f)
+        for (row in 0 until rows) {
+            val distance = abs(y - sliderTrackY(rect, row))
+            if (distance < bestDistance) {
+                bestDistance = distance
+                best = row
+            }
+        }
+        return best
+    }
+
+    /**
+     * Moves the setting of [row] to wherever a finger at [x] is on its track:
+     * the control's size, or the shared stick deadzone and curve.
+     */
+    private fun setSliderFromFinger(row: Int, x: Float) {
+        val target = resizeTarget ?: return
+        val rect = sliderRect()
+        val trackLeft = rect.left + dp(34f)
+        val trackRight = rect.right - dp(34f)
+        if (trackRight <= trackLeft) return
+        val fraction = ResizeSlider.fractionAt(x, trackLeft, trackRight)
+        when (row) {
+            ROW_SIZE -> applyScale(
+                target, ResizeSlider.scaleAt(fraction, MIN_CONTROL_SCALE, MAX_CONTROL_SCALE)
+            )
+
+            // Five-percent steps on the axes: a pixel more would not be seen,
+            // and the label would flicker between neighbouring values.
+            ROW_WIDTH -> applyStretch(
+                target,
+                quantise(
+                    ResizeSlider.scaleAt(fraction, MIN_AXIS_SCALE, MAX_AXIS_SCALE), AXIS_STEP
+                ),
+                target.scaleY
+            )
+
+            ROW_HEIGHT -> applyStretch(
+                target,
+                target.scaleX,
+                quantise(
+                    ResizeSlider.scaleAt(fraction, MIN_AXIS_SCALE, MAX_AXIS_SCALE), AXIS_STEP
+                )
+            )
+
+            // Whole percents and tenths, for the same reason.
+            ROW_DEADZONE -> stickDeadzone =
+                (ResizeSlider.scaleAt(
+                    fraction, StickResponse.DEADZONE_MIN, StickResponse.DEADZONE_MAX
+                ) * 100f).roundToInt() / 100f
+
+            ROW_CURVE -> stickCurve =
+                (ResizeSlider.scaleAt(
+                    fraction, StickResponse.CURVE_MIN, StickResponse.CURVE_MAX
+                ) * 10f).roundToInt() / 10f
+        }
+        invalidate()
+    }
+
+    /**
+     * Sets a control's user size. Both the pinch and the slider funnel through
+     * here, so the limits and the safe-area rule cannot drift apart.
+     */
+    private fun applyScale(control: Control, scale: Float) {
+        if (control.baseRadius <= 0f) return
+        control.scale = scale.coerceIn(MIN_CONTROL_SCALE, MAX_CONTROL_SCALE)
+        control.radius = control.baseRadius * control.scale
+        keepInsideSafeArea(control)
+    }
+
+    /**
+     * Sets how much wider and taller a control is drawn. Its base radius is
+     * left alone, so SIZE keeps meaning "both axes together" and a width
+     * change never moves the height.
+     */
+    private fun applyStretch(control: Control, scaleX: Float, scaleY: Float) {
+        if (control.baseRadius <= 0f) return
+        control.scaleX = scaleX.coerceIn(MIN_AXIS_SCALE, MAX_AXIS_SCALE)
+        control.scaleY = scaleY.coerceIn(MIN_AXIS_SCALE, MAX_AXIS_SCALE)
+        keepInsideSafeArea(control)
+    }
+
+    /** Rounds to the nearest [step], so a slider settles on tidy values. */
+    private fun quantise(value: Float, step: Float): Float =
+        (value / step).roundToInt() * step
 
     private fun withAlpha(color: Int, alpha: Int): Int =
         (color and 0x00FFFFFF) or (alpha shl 24)
@@ -1238,6 +1694,14 @@ class ControllerView @JvmOverloads constructor(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // Android normally batches motion events so the app sees one per frame.
+        // For a gamepad that is up to a frame of delay added before the touch is
+        // even read, and it is the largest thing this app can do about latency:
+        // ask for the events as they happen instead of at the next vsync. The
+        // request covers this gesture; it is made again on every new touch.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            requestUnbufferedDispatch(event)
+        }
         if (isPanningBackground) {
             handleBackgroundPanTouch(event)
             return true
@@ -1246,6 +1710,36 @@ class ControllerView @JvmOverloads constructor(
             handleEditTouch(event)
             return true
         }
+        inTouchBatch = true
+        batchChanged = false
+        try {
+            handlePlayTouch(event)
+        } finally {
+            inTouchBatch = false
+        }
+        flushTouchBatch()
+        return true
+    }
+
+    /**
+     * Buzz, but only after the state it is buzzing about has been handed over.
+     * The vibrator is a binder call of its own; letting it go first inside a
+     * touch event would put it ahead of the press it is supposed to confirm.
+     */
+    private fun buzz(strong: Boolean = true) {
+        flushTouchBatch()
+        if (strong) haptics.press() else haptics.tick()
+    }
+
+    /** Hands the state of the event being applied to the listener, once. */
+    private fun flushTouchBatch() {
+        if (!batchChanged) return
+        batchChanged = false
+        listener?.onTouchStateChanged()
+    }
+
+    /** Applies one event's pointers to the controls in play mode. */
+    private fun handlePlayTouch(event: MotionEvent) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val index = event.actionIndex
@@ -1299,7 +1793,6 @@ class ControllerView @JvmOverloads constructor(
                 invalidate()
             }
         }
-        return true
     }
 
     private var panLastX = 0f
@@ -1332,43 +1825,227 @@ class ControllerView @JvmOverloads constructor(
         }
     }
 
-    /** In edit mode, fingers drag controls instead of pressing them. */
+    /**
+     * In edit mode, fingers drag controls instead of pressing them. Two ways
+     * to resize: tap a control to open its size slider and drag left or right
+     * (easy, one finger), or pinch the control with two fingers (direct). Tap
+     * empty space to close the slider. Sizes are saved with the positions, per
+     * skin and orientation, like everything else.
+     */
     private fun handleEditTouch(event: MotionEvent) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val index = event.actionIndex
                 val x = event.getX(index)
                 val y = event.getY(index)
-                val control = activeControls.firstOrNull { !it.pressed && it.contains(x, y) }
-                if (control != null) {
-                    control.pointerId = event.getPointerId(index)
-                    haptics.tick()
+                val id = event.getPointerId(index)
+                // The panel is drawn over the controls, so it takes the finger
+                // first: a drag on its track resizes instead of moving a button.
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    val row = sliderRowAt(x, y)
+                    if (row >= 0) {
+                        sliderPointerId = id
+                        sliderRow = row
+                        setSliderFromFinger(row, x)
+                        buzz(strong = false)
+                        return
+                    }
+                }
+                // A second finger landing on — or near — a control that is
+                // already held starts a pinch on it, rather than grabbing a
+                // neighbouring control that happens to be underneath.
+                val held = pinchCandidate(x, y)
+                if (held != null) {
+                    held.secondPointerId = id
+                    held.pinchStartSpan = pointerSpan(event, held.pointerId, id)
+                    held.pinchStartRadius = held.radius
+                    // Two fingers are never a tap, and the panel follows the
+                    // control being pinched so its percentage stays honest.
+                    tapPointerId = -1
+                    resizeTarget = held
+                    buzz(strong = false)
                     invalidate()
+                } else {
+                    val control = activeControls.firstOrNull { !it.pressed && it.contains(x, y) }
+                    if (control != null) {
+                        control.pointerId = id
+                        releasePinch(control)
+                        buzz(strong = false)
+                        invalidate()
+                    }
+                    if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                        // Held until the finger lifts: staying put opens the
+                        // size panel, travelling moves the button instead.
+                        tapPointerId = id
+                        tapDownX = x
+                        tapDownY = y
+                        tapTarget = control
+                    }
                 }
             }
 
             MotionEvent.ACTION_MOVE -> {
+                // Dragging the panel's track resizes, and stops being a tap.
+                if (sliderPointerId != -1) {
+                    val sliderIndex = event.findPointerIndex(sliderPointerId)
+                    if (sliderIndex >= 0) {
+                        setSliderFromFinger(sliderRow, event.getX(sliderIndex))
+                        tapPointerId = -1
+                        tapTarget = null
+                    }
+                }
+                if (tapPointerId != -1) {
+                    val tapIndex = event.findPointerIndex(tapPointerId)
+                    val moved = tapIndex < 0 || !ResizeSlider.isTap(
+                        event.getX(tapIndex) - tapDownX,
+                        event.getY(tapIndex) - tapDownY,
+                        touchSlop
+                    )
+                    if (moved) {
+                        tapPointerId = -1
+                        tapTarget = null
+                    }
+                }
+                var changed = false
+                // Resize first: a control with two fingers down is being
+                // pinched, so its centre must not follow either finger.
+                for (control in activeControls) {
+                    if (control.secondPointerId == -1) continue
+                    if (!resizeByPinch(event, control)) continue
+                    changed = true
+                }
                 for (i in 0 until event.pointerCount) {
                     val id = event.getPointerId(i)
-                    val control = activeControls.firstOrNull { it.pointerId == id } ?: continue
+                    if (id == sliderPointerId) continue
+                    val control = activeControls.firstOrNull {
+                        it.pointerId == id && it.secondPointerId == -1
+                    } ?: continue
                     control.cx = event.getX(i)
-                        .coerceIn(safeLeft + control.radius, width - safeRight - control.radius)
                     control.cy = event.getY(i)
-                        .coerceIn(safeTop + control.radius, height - safeBottom - control.radius)
+                    keepInsideSafeArea(control)
+                    changed = true
                 }
-                invalidate()
+                if (changed) invalidate()
             }
 
             MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
-                    for (control in activeControls) control.pointerId = -1
+                    for (control in activeControls) {
+                        control.pointerId = -1
+                        releasePinch(control)
+                    }
+                    sliderPointerId = -1
+                    sliderRow = 0
+                    tapPointerId = -1
+                    tapTarget = null
                 } else {
-                    val id = event.getPointerId(event.actionIndex)
-                    activeControls.firstOrNull { it.pointerId == id }?.pointerId = -1
+                    val index = event.actionIndex
+                    val id = event.getPointerId(index)
+                    if (id == sliderPointerId) {
+                        sliderPointerId = -1
+                        sliderRow = 0
+                    }
+                    if (id == tapPointerId) {
+                        // A tap on a button opens its size panel; a tap that
+                        // landed on empty space closes it again.
+                        val target = tapTarget
+                        val still = ResizeSlider.isTap(
+                            event.getX(index) - tapDownX,
+                            event.getY(index) - tapDownY,
+                            touchSlop
+                        )
+                        tapPointerId = -1
+                        tapTarget = null
+                        if (still) {
+                            resizeTarget = target
+                            if (target != null) buzz(strong = false)
+                        }
+                    }
+                    for (control in activeControls) {
+                        // Lifting either pinch finger ends the pinch; the finger
+                        // still down keeps dragging the control.
+                        if (control.secondPointerId == id) releasePinch(control)
+                        if (control.pointerId == id) {
+                            control.pointerId = -1
+                            releasePinch(control)
+                        }
+                    }
                 }
                 invalidate()
             }
         }
+    }
+
+    /**
+     * The control a second finger at ([x], [y]) should pinch, if any: one that
+     * is already held, is inside its loose grab area, and is not beaten to the
+     * finger by an idle control underneath. Without that last rule the wide
+     * grab area would steal fingers from the control it overlaps and break
+     * dragging two buttons at once.
+     */
+    private fun pinchCandidate(x: Float, y: Float): Control? {
+        val held = activeControls.firstOrNull {
+            it.pointerId != -1 && it.secondPointerId == -1 &&
+                it.contains(x, y, PINCH_GRAB_TOLERANCE)
+        } ?: return null
+        val toHeld = hypot((x - held.cx).toDouble(), (y - held.cy).toDouble())
+        val closerControl = activeControls.any { other ->
+            other !== held && other.pointerId == -1 && other.contains(x, y) &&
+                hypot((x - other.cx).toDouble(), (y - other.cy).toDouble()) < toHeld
+        }
+        return if (closerControl) null else held
+    }
+
+    /** Distance in pixels between two pointers, or 0 if either has left. */
+    private fun pointerSpan(event: MotionEvent, firstId: Int, secondId: Int): Float {
+        val first = event.findPointerIndex(firstId)
+        val second = event.findPointerIndex(secondId)
+        if (first < 0 || second < 0) return 0f
+        return hypot(
+            (event.getX(second) - event.getX(first)).toDouble(),
+            (event.getY(second) - event.getY(first)).toDouble()
+        ).toFloat()
+    }
+
+    /**
+     * Resizes [control] from the current distance between its two fingers.
+     * Returns false when the gesture has no usable geometry yet.
+     */
+    private fun resizeByPinch(event: MotionEvent, control: Control): Boolean {
+        if (control.pinchStartSpan <= 0f || control.baseRadius <= 0f) return false
+        val span = pointerSpan(event, control.pointerId, control.secondPointerId)
+        if (span <= 0f) return false
+        val radius = control.pinchStartRadius * (span / control.pinchStartSpan)
+        applyScale(control, radius / control.baseRadius)
+        return true
+    }
+
+    /**
+     * Keeps a control's centre inside the safe area. A control pinched larger
+     * than the area can still be centred, so this never narrows to an
+     * impossible range.
+     */
+    private fun keepInsideSafeArea(control: Control) {
+        // The widest point, so a stretched control is kept on screen too.
+        val midX = (safeLeft + width - safeRight) / 2f
+        val midY = (safeTop + height - safeBottom) / 2f
+        val minX = safeLeft + control.rx
+        val maxX = width - safeRight - control.rx
+        control.cx = if (minX <= maxX) control.cx.coerceIn(minX, maxX) else midX
+        val minY = safeTop + control.ry
+        val maxY = height - safeBottom - control.ry
+        control.cy = if (minY <= maxY) control.cy.coerceIn(minY, maxY) else midY
+    }
+
+    /**
+     * Applies a control's stretch to the canvas, so its drawn shape and its
+     * touch area are the same oval. Every control's art is written around a
+     * circle; this is what turns that circle into the shape the user set.
+     */
+    private fun stretchCanvas(canvas: Canvas, control: Control) {
+        canvas.translate(control.cx, control.cy)
+        canvas.scale(control.scaleX, control.scaleY)
+        canvas.translate(-control.cx, -control.cy)
     }
 
     /**
@@ -1382,6 +2059,18 @@ class ControllerView @JvmOverloads constructor(
     }
 
     private fun notifyChanged() {
+        // One finger moving can touch several controls, and a whole event batch
+        // is one moment in time as far as the host is concerned: report it once,
+        // after every pointer in the event has been applied. Sending per control
+        // put half-updated states in front of the newest one for no reason.
+        if (inTouchBatch) {
+            batchChanged = true
+            return
+        }
         listener?.onTouchStateChanged()
     }
+
+    /** True while a single MotionEvent is being applied to the controls. */
+    private var inTouchBatch = false
+    private var batchChanged = false
 }

@@ -36,11 +36,16 @@
         android:theme="@style/Theme.PocketPad"
         tools:targetApi="34">
 
+        <!--
+          A gamepad is held sideways, so the activity opens in landscape and follows the
+          sensor: the pad is oriented correctly the moment the app starts instead of
+          following the phone's portrait default.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:screenOrientation="fullUser"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation"
             android:theme="@style/Theme.PocketPad">
 

@@ -270,6 +270,54 @@ class HidReportRequestsTest {
         }
     }
 
+    // --------------------------------------- the state a poll is answered with
+
+    /**
+     * A host that polls instead of listening for changes is asking what the pad
+     * is doing now. Answering with the neutral report would release every button
+     * the user is holding.
+     */
+    @Test
+    fun aPollIsAnsweredWithTheStateThePadLastSent() {
+        val held = HidConstants.neutralGamepadReport().copyOf().also {
+            it[2] = 0x01.toByte() // the first button's bit
+        }
+        val payload = replyBytes(
+            HidReportRequests.getReport(INPUT, gamepadId, 0, INPUT, held)
+        )
+        assertArrayEquals(held, payload)
+    }
+
+    @Test
+    fun aPollBeforeAnythingWasSentGetsTheNeutralReport() {
+        assertArrayEquals(
+            HidConstants.neutralGamepadReport(),
+            replyBytes(HidReportRequests.getReport(INPUT, gamepadId, 0, INPUT, null))
+        )
+    }
+
+    /**
+     * A state of the wrong length belongs to another report id. Truncating it
+     * would answer a keyboard poll with gamepad bytes — the exact defect this
+     * object exists to prevent.
+     */
+    @Test
+    fun aStateOfTheWrongLengthIsIgnoredRatherThanReused() {
+        val gamepadSized = ByteArray(HidConstants.GAMEPAD_REPORT_SIZE) { 0x55 }
+        assertArrayEquals(
+            HidConstants.neutralKeyboardReport(),
+            replyBytes(HidReportRequests.getReport(INPUT, keyboardId, 0, INPUT, gamepadSized))
+        )
+    }
+
+    @Test
+    fun aSmallBufferStillTruncatesTheCurrentState() {
+        val held = ByteArray(HidConstants.GAMEPAD_REPORT_SIZE) { 0x11 }
+        val payload = replyBytes(HidReportRequests.getReport(INPUT, gamepadId, 3, INPUT, held))
+        assertEquals(3, payload.size)
+        assertArrayEquals(held.copyOf(3), payload)
+    }
+
     // ------------------------------------------- agreement with the real code
 
     /**

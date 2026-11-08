@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.PocketPad" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">@color/pp_background</item>
@@ -6,5 +5,19 @@
         <item name="android:navigationBarColor">@color/pp_background</item>
         <item name="colorAccent">@color/pp_accent</item>
         <item name="android:colorBackground">@color/pp_background</item>
+
+        <!--
+          Fullscreen before the first frame, so the pad never starts a pixel short of the
+          screen edges and then jumps once immersive mode is applied.
+        -->
+        <item name="android:windowFullscreen">true</item>
+
+        <!--
+          Draw into the display cutout instead of being kept clear of it. Without this the
+          window is laid out beside the notch and leaves an empty strip along one edge,
+          which is exactly what "not quite fullscreen" looks like on a phone with a camera
+          hole. MainActivity also sets this at runtime; the theme covers the first frame.
+        -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
 </resources>
