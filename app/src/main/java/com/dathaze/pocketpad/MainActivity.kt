@@ -234,7 +234,10 @@ class MainActivity : AppCompatActivity(),
         // Guarded for the same reason as the two above: setContentView or findViewById failing
         // would leave this unset, and an unguarded read here would throw on the way out and
         // bury the exception that actually caused the problem.
-        if (::controllerView.isInitialized) controllerView.setBackgroundImage(null, 0.5f, 0.5f)
+        if (::controllerView.isInitialized) {
+            controllerView.setBackgroundImage(null, 0.5f, 0.5f)
+            controllerView.haptics.shutdown()
+        }
     }
 
     private fun enterImmersiveMode() {

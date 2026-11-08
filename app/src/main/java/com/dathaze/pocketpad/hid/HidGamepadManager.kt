@@ -12,6 +12,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -108,6 +109,13 @@ class HidGamepadManager(private val context: Context, private val listener: List
     private val keyCoalescer = ReportCoalescer()
     private val senderLock = Any()
     private var senderQueued = false
+
+    /**
+     * When the oldest report still waiting was offered while the link was down.
+     * A press made during a short drop is worth delivering the moment the host
+     * is back; one from several seconds ago is a press nobody is still making.
+     */
+    private var heldWhileDownAt = 0L
     @Volatile private var sender: ExecutorService? = null
 
     val isConnected: Boolean get() = connectedDevice != null
@@ -311,12 +319,26 @@ class HidGamepadManager(private val context: Context, private val listener: List
      * changes rather than a constant stream.
      */
     fun send(state: GamepadState) {
-        if (hidDevice == null || connectedDevice == null) return
+        if (hidDevice == null) return
         val report = state.toReport()
+        val connected = connectedDevice != null
         synchronized(senderLock) {
+            // Offered even with the link down. A press made in the moment a
+            // dropped link takes to come back used to be thrown away here, and
+            // the player felt that as a button that had to be pressed twice.
+            // It waits in the same two-slot queue and goes out on reconnect;
+            // [MAX_REPLAY_AGE_MS] is what keeps an old one from arriving as a
+            // press nobody is making.
             coalescer.offer(report)
+            if (!connected && heldWhileDownAt == 0L) {
+                heldWhileDownAt = SystemClock.uptimeMillis()
+            }
         }
-        kickSender()
+        // Checked again rather than trusting the read above: the link can come
+        // up between offering the state and this line, and that connect already
+        // kicked a sender that found an empty queue. Without this the press
+        // would wait for the next touch.
+        if (connected || connectedDevice != null) kickSender()
     }
 
     /** Make sure exactly one sending task is on its way. */
@@ -401,7 +423,10 @@ class HidGamepadManager(private val context: Context, private val listener: List
         // CPU — scheduling jitter here is latency the app adds by itself.
         val created = Executors.newSingleThreadExecutor { task ->
             Thread({
-                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+                // Urgent-display rather than display: this thread's only job is
+                // a binder call, and every millisecond it waits its turn is a
+                // press the player feels late.
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 task.run()
             }, "pocketpad-hid-send")
         }
@@ -534,6 +559,17 @@ class HidGamepadManager(private val context: Context, private val listener: List
                     reconnectAttempts = 0
                     mainHandler.removeCallbacks(reconnectRunnable)
                     mainHandler.removeCallbacks(connectWatchdog)
+                    // Anything held through the drop goes out now — unless the
+                    // drop was long enough that delivering it would invent a
+                    // press nobody made. The state the pad is in right now is
+                    // asked for by onHidConnected, and that one always goes.
+                    val heldTooLong = synchronized(senderLock) {
+                        val held = heldWhileDownAt
+                        heldWhileDownAt = 0L
+                        held != 0L && SystemClock.uptimeMillis() - held > MAX_REPLAY_AGE_MS
+                    }
+                    if (heldTooLong) synchronized(senderLock) { coalescer.reset() }
+                    kickSender()
                     post { listener.onHidConnected(device) }
                 }
                 BluetoothProfile.STATE_CONNECTING ->
@@ -543,6 +579,7 @@ class HidGamepadManager(private val context: Context, private val listener: List
                     synchronized(senderLock) {
                         coalescer.reset()
                         keyCoalescer.reset()
+                        heldWhileDownAt = 0L
                     }
                     lastGamepadReport = null
                     lastKeyReport = null
@@ -563,9 +600,15 @@ class HidGamepadManager(private val context: Context, private val listener: List
         override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {
             val proxy = hidDevice ?: return
             try {
+                // The newest state *offered*, not the last one the radio
+                // accepted: sendReport returning true only means the stack
+                // took it, so `lastGamepadReport` can already be a state or two
+                // behind what the pad is actually doing.
                 val current = when (id.toInt() and 0xFF) {
-                    HidConstants.REPORT_ID -> lastGamepadReport
-                    HidConstants.REPORT_ID_KEYBOARD -> lastKeyReport
+                    HidConstants.REPORT_ID ->
+                        synchronized(senderLock) { coalescer.newestOffered() } ?: lastGamepadReport
+                    HidConstants.REPORT_ID_KEYBOARD ->
+                        synchronized(senderLock) { keyCoalescer.newestOffered() } ?: lastKeyReport
                     else -> null
                 }
                 val outcome = HidReportRequests.getReport(
@@ -636,9 +679,19 @@ class HidGamepadManager(private val context: Context, private val listener: List
 
         /**
          * Pause after the radio refuses a report. `sendReport` returns false when
-         * its queue is full; retrying on the next instruction would spin.
+         * its queue is full; retrying on the next instruction would spin. Three
+         * milliseconds is enough to stop the spin and short enough to be a
+         * rounding error next to a radio turnaround — this sleep used to be a
+         * visible floor under the latency of every congested report.
          */
-        const val REFUSED_RETRY_DELAY_MS = 10L
+        const val REFUSED_RETRY_DELAY_MS = 3L
+
+        /**
+         * How long a state may wait for a link that is down before it stops
+         * being worth sending. A tap during a one-second drop is still a tap
+         * the host should see; one from ten seconds ago is not.
+         */
+        const val MAX_REPLAY_AGE_MS = 1500L
 
         /**
          * Whether to ask for a custom L2CAP flow spec instead of the stack default.

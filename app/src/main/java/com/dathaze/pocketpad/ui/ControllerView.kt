@@ -884,6 +884,15 @@ class ControllerView @JvmOverloads constructor(
     // Tint between picture and controls so buttons always stay readable.
     private val scrimColor = Color.argb(110, 6, 7, 12)
 
+    // The picture with its crop, scale and scrim already applied: built when one
+    // of those changes, blitted 1:1 on every other frame. See [drawBackgroundImage].
+    private var bgCache: Bitmap? = null
+    private var bgCacheSource: Bitmap? = null
+    private var bgCacheW = 0
+    private var bgCacheH = 0
+    private var bgCachePanX = -1f
+    private var bgCachePanY = -1f
+
     /** True while the user is dragging the background picture into place. */
     var isPanningBackground = false
         private set
@@ -901,6 +910,8 @@ class ControllerView @JvmOverloads constructor(
         }
         bgPanX = panX.coerceIn(0f, 1f)
         bgPanY = panY.coerceIn(0f, 1f)
+        // The composited copy describes the picture that is leaving, not this one.
+        dropBackgroundCache()
         invalidate()
     }
 
@@ -1658,12 +1669,41 @@ class ControllerView @JvmOverloads constructor(
      * Center-crop the picture to fill the screen; [bgPanX]/[bgPanY] slide it
      * inside the overflow so the user can frame it however they like. The
      * scrim on top keeps the controls readable over any photo.
+     *
+     * The crop is composited once into a screen-sized bitmap and blitted 1:1
+     * afterwards, scrim included, so a touch redraws the pad rather than the
+     * photograph behind it: the sampling of a large source bitmap and the
+     * full-screen blend happened on every frame before. While the picture is
+     * being dragged the crop changes every frame, and there the source is drawn
+     * directly — rebuilding a screen-sized bitmap per frame would cost more than
+     * the scale it saves.
      */
     private fun drawBackgroundImage(canvas: Canvas) {
         val bmp = bgBitmap ?: return
+        val vw = width
+        val vh = height
+        if (vw <= 0 || vh <= 0) return
+        if (isPanningBackground) {
+            drawBackgroundSource(canvas, bmp)
+            return
+        }
+        if (bgCache == null || bgCacheSource !== bmp || bgCacheW != vw ||
+            bgCacheH != vh || bgCachePanX != bgPanX || bgCachePanY != bgPanY
+        ) {
+            rebuildBackgroundCache(bmp, vw, vh)
+        }
+        val cached = bgCache
+        if (cached != null) {
+            canvas.drawBitmap(cached, 0f, 0f, null)
+        } else {
+            drawBackgroundSource(canvas, bmp)
+        }
+    }
+
+    /** The picture cropped and scaled straight onto the frame, scrim on top. */
+    private fun drawBackgroundSource(canvas: Canvas, bmp: Bitmap) {
         val vw = width.toFloat()
         val vh = height.toFloat()
-        if (vw <= 0f || vh <= 0f) return
         val scale = max(vw / bmp.width, vh / bmp.height)
         val dw = bmp.width * scale
         val dh = bmp.height * scale
@@ -1675,6 +1715,44 @@ class ControllerView @JvmOverloads constructor(
         canvas.drawBitmap(bmp, 0f, 0f, bgBitmapPaint)
         canvas.restore()
         canvas.drawColor(scrimColor)
+    }
+
+    /**
+     * Build the composited copy. The copy it replaces is dropped, not recycled:
+     * a hardware canvas may still be drawing the frame that referenced it, and
+     * recycling underneath a display list is a crash rather than a saving.
+     */
+    private fun rebuildBackgroundCache(bmp: Bitmap, vw: Int, vh: Int) {
+        bgCache = null
+        val scale = max(vw.toFloat() / bmp.width, vh.toFloat() / bmp.height)
+        val dw = bmp.width * scale
+        val dh = bmp.height * scale
+        val dx = -(dw - vw) * bgPanX
+        val dy = -(dh - vh) * bgPanY
+        bgCache = try {
+            Bitmap.createBitmap(vw, vh, Bitmap.Config.ARGB_8888).also { out ->
+                val c = Canvas(out)
+                c.save()
+                c.translate(dx, dy)
+                c.scale(scale, scale)
+                c.drawBitmap(bmp, 0f, 0f, bgBitmapPaint)
+                c.restore()
+                c.drawColor(scrimColor)
+            }
+        } catch (_: OutOfMemoryError) {
+            null
+        }
+        bgCacheSource = bmp
+        bgCacheW = vw
+        bgCacheH = vh
+        bgCachePanX = bgPanX
+        bgCachePanY = bgPanY
+    }
+
+    /** Forget the composited copy; the picture or its crop is about to change. */
+    private fun dropBackgroundCache() {
+        bgCache = null
+        bgCacheSource = null
     }
 
     private fun drawArrow(canvas: Canvas, x: Float, y: Float, size: Float, rotation: Float) {

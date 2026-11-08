@@ -118,6 +118,32 @@ class ReportCoalescerTest {
         assertArrayEquals(report(8), coalescer.take())
     }
 
+    @Test
+    fun theNewestOfferedStateIsWhatAPollShouldAnswer() {
+        // A host polling with Get_Report asks what the pad is doing now. The
+        // oldest state is still owed to the radio, so the newest one is the only
+        // honest answer until it has actually gone out.
+        val coalescer = ReportCoalescer()
+        assertNull(coalescer.newestOffered())
+        coalescer.offer(report(1, 0))
+        coalescer.offer(report(2, 0))
+        assertArrayEquals(report(2, 0), coalescer.newestOffered())
+        assertArrayEquals(report(1, 0), coalescer.take())
+        // Taking the owed state does not send the poll back in time.
+        assertArrayEquals(report(2, 0), coalescer.newestOffered())
+    }
+
+    @Test
+    fun aRefusedReportIsTheNewestAgain() {
+        // failed() puts a refused state back at the front: the host is still
+        // waiting for that press, so a poll has to be told about it.
+        val coalescer = ReportCoalescer()
+        coalescer.offer(report(1))
+        coalescer.offer(report(2))
+        coalescer.failed(coalescer.take()!!)
+        assertArrayEquals(report(1), coalescer.newestOffered())
+    }
+
     private fun assertTakes(coalescer: ReportCoalescer, expected: ByteArray) {
         assertArrayEquals(expected, coalescer.take())
     }

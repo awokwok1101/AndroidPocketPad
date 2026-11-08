@@ -55,6 +55,16 @@ class ReportCoalescer {
     fun take(): ByteArray? = pending.removeFirstOrNull()
 
     /**
+     * The state the host is heading for: the newest one offered.
+     *
+     * A host that polls with Get_Report is asking what the pad is doing *now*,
+     * and this is the honest answer -- the last one [take] handed out may still
+     * be sitting in the radio's queue, describing where the stick was. Null
+     * before anything has been offered.
+     */
+    fun newestOffered(): ByteArray? = newest
+
+    /**
      * The stack refused [report], the one [take] handed out. It goes back to the
      * front: a refused press is exactly the press the player is waiting for.
      * [newest] follows it, so a state that was dropped to make room is queued
